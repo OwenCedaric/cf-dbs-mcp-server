@@ -6,5 +6,6 @@
   "metric": "cosine",
   "pooling": "cls",
   "normalize": true,
-  "dtype": "fp32"
+  "dtype": "fp32",
+  "search_methods": ["GET", "POST"]
 }
