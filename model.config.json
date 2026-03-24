@@ -1,0 +1,10 @@
+{
+  "index_name": "atoms-index",
+  "local_model_id": "Xenova/bge-m3",
+  "remote_model_id": "@cf/baai/bge-m3",
+  "dimensions": 1024,
+  "metric": "cosine",
+  "pooling": "cls",
+  "normalize": true,
+  "dtype": "fp32"
+}

@@ -1,0 +1,152 @@
+name: Deploy DBS MCP Server
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'atoms.jsonl'
+      - 'src/**'
+      - 'scripts/**'
+      - '.github/workflows/deploy.yml'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v5
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          cache: 'pnpm'
+
+      - name: Install Dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v45
+        with:
+          files: |
+            scripts/generate_vectors.js
+
+      - name: Cache Atoms Hash
+        id: cache-hash
+        uses: actions/cache@v4
+        with:
+          path: .atoms_hash
+          key: atoms-hash-${{ runner.os }}-${{ github.run_id }}
+          restore-keys: |
+            atoms-hash-${{ runner.os }}-
+
+      - name: Check for updates
+        id: check_updates
+        run: |
+          ATOMS_URL='https://raw.githubusercontent.com/dontbesilent2025/dbskill/refs/heads/main/%E7%9F%A5%E8%AF%86%E5%BA%93/%E5%8E%9F%E5%AD%90%E5%BA%93/atoms.jsonl'
+          
+          # Get current hash of remote file
+          curl -sL "$ATOMS_URL" > atoms.jsonl
+          NEW_HASH=$(shasum -a 256 atoms.jsonl | cut -d ' ' -f 1)
+          
+          # Check script changes
+          SCRIPT_CHANGED="${{ steps.changed-files.outputs.any_changed }}"
+          
+          # Load cached hash
+          OLD_HASH_FILE=".atoms_hash"
+          if [ -f "$OLD_HASH_FILE" ]; then
+            OLD_HASH=$(cat "$OLD_HASH_FILE")
+          else
+            OLD_HASH=""
+          fi
+          
+          if [ "$SCRIPT_CHANGED" = "true" ] || [ "$NEW_HASH" != "$OLD_HASH" ]; then
+            echo "updated=true" >> $GITHUB_OUTPUT
+            echo "$NEW_HASH" > "$OLD_HASH_FILE"
+            echo "Detection result: Updated (Script: $SCRIPT_CHANGED, Hash changed: $([ "$NEW_HASH" != "$OLD_HASH" ] && echo "true" || echo "false"))"
+          else
+            echo "updated=false" >> $GITHUB_OUTPUT
+            echo "Detection result: No changes"
+          fi
+
+
+      - name: Backup Data to data-backup branch
+        if: steps.check_updates.outputs.updated == 'true'
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Save current file to a temporary location
+          cp atoms.jsonl /tmp/atoms.jsonl
+          
+          # Force fetch to get common ancestor
+          git fetch origin main
+          
+          # Fetch and checkout the backup branch, or create it if it doesn't exist
+          if git fetch origin data-backup:data-backup; then
+            git checkout data-backup
+          else
+            git checkout --orphan data-backup
+            git rm -rf .
+          fi
+          
+          # Overwrite the backup file
+          cp /tmp/atoms.jsonl atoms.jsonl
+          git add atoms.jsonl
+          
+          if git diff-index --quiet HEAD --; then
+            echo "No changes to backup."
+          else
+            git commit -m "Backup atoms.jsonl: $(date +'%Y-%m-%d %H:%M:%S')"
+            git push origin data-backup
+          fi
+          
+          # Return to main branch
+          git checkout main --
+
+      - name: Recreate Vectorize Index
+        if: steps.check_updates.outputs.updated == 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          command: |
+            INDEX_NAME=$(jq -r '.index_name' model.config.json)
+            DIMENSIONS=$(jq -r '.dimensions' model.config.json)
+            METRIC=$(jq -r '.metric' model.config.json)
+            wrangler vectorize delete $INDEX_NAME || true
+            wrangler vectorize create $INDEX_NAME --dimensions $DIMENSIONS --metric $METRIC
+
+      - name: Generate Vectors
+        if: steps.check_updates.outputs.updated == 'true'
+        run: pnpm run build-vectors
+
+      - name: Upload Vectors to Cloudflare
+        if: steps.check_updates.outputs.updated == 'true'
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          command: |
+            INDEX_NAME=$(jq -r '.index_name' model.config.json)
+            wrangler vectorize insert $INDEX_NAME --file vectors.ndjson
+
+      - name: Deploy Worker
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CF_API_TOKEN }}
+          accountId: ${{ secrets.CF_ACCOUNT_ID }}
+          command: deploy
+          secrets: |
+            AUTH_TOKEN
+        env:
+          AUTH_TOKEN: ${{ secrets.AUTH_TOKEN }}
